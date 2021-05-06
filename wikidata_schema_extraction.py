@@ -2,7 +2,7 @@ import requests
 import html
 import json
 from configparser import ConfigParser
-import psycopg2 #Dependency used for connection to SparSql database
+import psycopg2 #Dependency used for connection to postgreSql database
 import time
 
 def config(section, filename='properties.ini'):
@@ -47,6 +47,10 @@ def queryWikiData(query):
         print("Query Limit reached. Retrying after {}s".format(sleepTime))
         time.sleep(sleepTime)
         queryWikiData(query)
+    elif response.status_code == 502: # Bad gateway server, let's just retry the query
+        print("Got bad gateway server in response, retrying query...")
+        time.sleep(10)
+        queryWikiData(query)
     else:
         print("WikiData returned response code - {}".format(response.status_code))
 
@@ -64,14 +68,69 @@ def insertClasses(connection, dict):
     connection.commit()
     cur.close()
 
+def insertProperties(connection, dict):
+    # Insert classes from given dictionary into target database
+    cur = connection.cursor()
+    baseSql = "INSERT INTO sample.properties(iri, cnt, display_name) VALUES('{}', {}, '{}');\n"
+    totalSql = ""
+    for key, value in dict.items():
+        labelValue = value['label']
+        if "'" in labelValue:
+            labelValue = labelValue.replace("'", "''")
+        totalSql = totalSql + baseSql.format(key,value['useCount'], labelValue)
+    cur.execute(totalSql)
+    connection.commit()
+    cur.close()
+
+def getProperties():
+    print("Getting list of properties...")
+    query = """
+        select distinct ?property (count(?item) as ?useCount) where {{
+           ?item ?property ?propValue
+        }}
+        GROUP BY ?property
+        ORDER BY DESC(?useCount)
+    """
+    responseDict = queryWikiData(query)
+    resultDict = {}
+    for i in responseDict['results']['bindings']:
+        resultDict[i['property']['value']] = {'useCount':i['useCount']['value'], 'label': ""}
+    return resultDict
+
+def getPropertyLabels(propertiesDict):
+    # Get labels for classes in a given dictionary
+    totalProps = len(propertiesDict)
+    print("Getting property labels for {} properties...".format(totalProps))
+    query = """
+        select distinct ?property ?propLabel where {{
+          VALUES ?property {{ {} }}
+          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
+          ?prop wikibase:directClaim ?property
+        }}
+    """
+    i = 0
+    propertyList = ""
+    for key in propertiesDict:
+        i = i + 1
+        propertyList = propertyList + " <" + key + ">"
+        # Query wikidata in batches of 15000 to maximize query time and minimize amount of queries
+        # Can't query in much bigger batches as then queries start to reach payload limit
+        if ((i % 15000) == 0) or (i == totalProps):
+            responseDict = queryWikiData(query.format(propertyList))
+            for j in responseDict['results']['bindings']:
+                if j['property']['value'] in propertiesDict:
+                    propertiesDict[j['property']['value']]['label'] = j['propLabel']['value']
+            propertyList = ""
+            print("{} done...".format(i))
+
 def getClasses():
     # Get all of the relevant classes from WikiData with at least 1 instance or subclass
     # First get the classes with subclasses
     print("Getting list of subclass classes...")
     query = """
-        select ?class (count(?y) as ?subclasses) where {
+        select ?class (count(?y) as ?subclasses) where {{
            ?y wdt:P279 ?class
-        }
+        }}
         GROUP BY ?class
         ORDER BY DESC(?subclasses)
     """
@@ -82,9 +141,9 @@ def getClasses():
     # Then get the classes with instances
     print("Getting list of instance classes...")
     query = """
-        select ?class (count(?y) as ?instances) where {
+        select ?class (count(?y) as ?instances) where {{
           ?y wdt:P31 ?class
-        }
+        }}
         GROUP BY ?class
         ORDER BY DESC(?instances)
     """
@@ -102,7 +161,7 @@ def getClassLabels(classDict):
     print("Getting class labels for {} classes...".format(totalClasses))
     query = """
         select ?class ?classLabel where {{
-           VALUES ?class {{{}}}
+           VALUES ?class {{ {} }}
            SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
         }}
     """
@@ -110,9 +169,9 @@ def getClassLabels(classDict):
     classList = ""
     for key in classDict:
         i = i + 1
-        classList = classList + " wd:" + key[31:]
-        # Query wikidata in batches of 20000 to maximize query time and minimize amount of queries
-        if ((i % 20000) == 0) or (i == totalClasses):
+        classList = classList + " <" + key + ">"
+        # Query wikidata in batches of 15000 to maximize query time and minimize amount of queries
+        if ((i % 15000) == 0) or (i == totalClasses):
             responseDict = queryWikiData(query.format(classList))
             for j in responseDict['results']['bindings']:
                 if j['class']['value'] in classDict:
@@ -121,10 +180,15 @@ def getClassLabels(classDict):
             print("{} done...".format(i))
 
 if __name__ == '__main__': 
-    dict = getClasses()
-    getClassLabels(dict)
     conf = config('postgreSqlConnection')
     
     getDbCon(conf)
-    insertClasses(DB_CON, dict)
+    propDict = getProperties()
+    getPropertyLabels(propDict)
+    insertProperties(DB_CON, propDict)
+    propDict.clear() # Clear the massive dictionary, to not take up RAM space
+    classDict = getClasses()
+    getClassLabels(classDict)
+    insertClasses(DB_CON, classDict)
+    classDict.clear()
     DB_CON.close()
