@@ -36,7 +36,7 @@ def queryWikiData(query):
     url = 'https://query.wikidata.org/sparql'
     body = {'query': query,
             'format': 'json',
-            'User-Agent': 'Bot for Student project/0.0 (vehiginters@gmail.com)',}
+            'User-Agent': 'Wikidata schema extraction Bot/1.0 (https://github.com/vehiginters/wikidata_export, vehiginters@gmail.com)',}
     response = requests.post(url, data = body)
     if response.ok:
         return json.loads(response.text)
