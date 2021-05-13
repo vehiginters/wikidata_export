@@ -78,8 +78,12 @@ def queryWikiData(query, retries=0):
         print("Got bad gateway server in response, retrying query...")
         time.sleep(30)
         queryWikiData(query+" ", retries+1)
+    elif response.status_code == 500: # Query timeout, can't do much about this besides skipping
+        print("Query timed out, skipping query - {}".format(query))
+        return {}
     else:
         print("WikiData returned response code - {}".format(response.status_code))
+        print("Failed query - {}".format(query))
 
 def insertClasses(connection, dict):
     # Insert classes from given dictionary into target database
@@ -116,31 +120,31 @@ def insertProperties(connection, dict):
     connection.commit()
     cur.close()
 
-def insertClassPropertyRelations(connection, dict):
+def insertClassPropertyRelations(cursor, relationList):
+    # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class and property iri's
+    # Should watch out, as the iri technically could not be unique, as that could brake this SQL
     baseSql = '''
-    INSERT INTO sample.cp_rels(class_id, property_id, type_id) 
+    INSERT INTO sample.cp_rels(class_id, property_id, type_id, cnt) 
     SELECT (SELECT id from sample.classes WHERE iri = '{classIri}') AS cl_id,
     (SELECT id from sample.properties WHERE iri = '{propIri}') AS pr_id,
-    1
+    (SELECT id from sample.cp_rel_types WHERE name = 'Outgoing'),
+    {cnt}
     HAVING (SELECT id from sample.classes WHERE iri = '{classIri}') IS NOT NULL
     AND (SELECT id from sample.properties WHERE iri = '{propIri}') IS NOT NULL;
     '''
-    # To-Do the hardcoded type id should be replaces like select from type table, just like for class-class relations
-    relations = len(dict)
     totalSql = ""
+    totalRelations = len(relationList)
     i = 0
-    for key, value in dict.items():
+    for class1, propery, cnt  in relationList:
         i = i + 1
-        totalSql = totalSql + baseSql.format(classIri = value['classId'], propIri = value['propId'])
-        if ((i % 1000) == 0) or (i == relations):
-            cur.execute(totalSql)
+        totalSql = totalSql + baseSql.format(classIri = class1, propIri = propery, cnt = cnt)
+        if ((i % 50000) == 0) or (i == totalRelations): 
+            cursor.execute(totalSql)
             totalSql = ""
-    connection.commit()
-    cur.close()
 
 def insertClassClassRelations(cursor, relationList):
     print("Inserting class relations into target database")
-    # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class iri's
+    # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class and property iri's
     # Should watch out, as the iri technically could not be unique, as that could brake this SQL
     baseSql = '''
         INSERT INTO sample.cc_rels(class_1_id, class_2_id, type_id)
@@ -151,9 +155,13 @@ def insertClassClassRelations(cursor, relationList):
         AND (SELECT id from sample.classes WHERE iri = '{class2Iri}') IS NOT NULL;
     '''
     totalSql = ""
+    totalRelations = len(relationList)
+    i = 0
     for class1, class2  in relationList:
         totalSql = totalSql + baseSql.format(class1Iri = class1, class2Iri = class2)
-    cursor.execute(totalSql)
+        if ((i % 50000) == 0) or (i == totalRelations): 
+            cursor.execute(totalSql)
+            totalSql = ""
     # Don't commit transaction just yet, because these relations are inserted in batches and not all at once
 
 def getProperties():
@@ -236,7 +244,7 @@ def getClassClassRelations(connection, classDict):
                 for j in responseDict:
                     if j['subclass']['value'] in classDict:
                         relationList.append((j['class']['value'], j['subclass']['value']))
-            responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
+                responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
             classList = ""
             relationsCounter = 0
             collectedClasses = 0
@@ -246,7 +254,7 @@ def getClassClassRelations(connection, classDict):
             if (currentRelations > 50000) or (i == totalClasses):
                 insertClassClassRelations(cur, relationList)
                 totalInsertedRelations = totalInsertedRelations + currentRelations
-                print("{} relations collected".format(totalInsertedRelations))
+                print("{} Class relations collected".format(totalInsertedRelations))
                 relationList.clear()
         collectedClasses = collectedClasses + 1
         classList = classList + " <" + key + ">"
@@ -254,15 +262,62 @@ def getClassClassRelations(connection, classDict):
     connection.commit()
     cur.close()
 
-def getClassPropertyRelations():
-    # To-Do
+def getClassPropertyRelations(connection, classDict):
+    # Implements a very similar algorithm as for class-class relations, but just collecting classes based on instance count
+    # Outgoing properties - 400k instance limit, otherwise timeouts
+    # This goes on for quite a while, taking up to 2 hours to get the outgoing properties
     query = """
-        select distinct ?property ?class where {{
-          ?y ?property ?class.
-          ?y wdt:P279|wdt:P31 ?class.
-          VALUES ?property {{ {} }}
+        select ?property ?class (count(?y) as ?propertyInstances) where {{
+           ?x wdt:P31 ?class.
+           ?x ?property ?y
+           VALUES ?class {{ {} }}
         }}
+        GROUP BY ?property ?class
     """
+    print("Getting Class property relations...")
+    i = 0
+    k = 0
+    instanceCounter = 0
+    totalClasses = len(classDict)
+    classList = ""
+    relationList = []
+    collectedClasses = 0
+    cur = connection.cursor()
+    totalInsertedRelations = 0
+    for key, value in classDict.items():
+        i = i + 1
+        if int(value['instances']) > 400000:
+            print("Class {} has too many instances, query will timeout, so skipping for now".format(key))
+            continue
+        # K: Counter to know which is the first processed class, can't use i for this, as we need also way to tell if it's the last class overall
+        k = k + 1
+        if k == 1 or i == totalClasses:
+            collectedClasses = collectedClasses + 1
+            classList = classList + " <" + key + ">"
+            instanceCounter = instanceCounter + int(value['instances'])
+            if k == 1:
+                continue
+        if ((instanceCounter + int(value['instances'])) > 200000) or (collectedClasses  == 5000) or (i == totalClasses):
+            responseDict = queryWikiData(query.format(classList))
+            if responseDict is not None:
+                for j in responseDict:
+                    relationList.append((j['class']['value'], j['property']['value'], int(j['propertyInstances']['value'])))
+                responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
+            classList = ""
+            instanceCounter = 0
+            collectedClasses = 0
+            currentRelations = len(relationList)
+            print("Property relations for {}/{} classes done...".format(i, totalClasses))
+            if (currentRelations > 50000) or (i == totalClasses):
+                insertClassPropertyRelations(cur, relationList)
+                totalInsertedRelations = totalInsertedRelations + currentRelations
+                print("{} relations collected".format(totalInsertedRelations))
+                relationList.clear()
+        collectedClasses = collectedClasses + 1
+        classList = classList + " <" + key + ">"
+        instanceCounter = instanceCounter + int(value['instances'])
+    connection.commit()
+    cur.close()
 
 def getClasses():
     # Get all of the relevant classes from WikiData with at least 1 instance
@@ -338,6 +393,7 @@ if __name__ == '__main__':
     classDict = getClasses()
     getClassLabels(classDict)
     insertClasses(DB_CON, classDict)
+    getClassPropertyRelations(DB_CON, classDict)
     getClassClassRelations(DB_CON, classDict)
     classDict.clear()
 
