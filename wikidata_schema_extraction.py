@@ -4,6 +4,7 @@ import json
 from configparser import ConfigParser
 import psycopg2 #Dependency used for connection to postgreSql database
 import time
+import math
 
 #List used for keeping track of number of queries in the last minute
 LAST_MINUTE_EVENTS = list()
@@ -74,6 +75,7 @@ def queryWikiData(query, retries=0):
         print("Query Limit reached. Retrying after {}s".format(sleepTime))
         time.sleep(sleepTime+1)
         queryWikiData(query+" ", retries+1)
+    # TO-DO failed queries should be logged, not printed out in stdout
     elif response.status_code == 502: # Bad gateway server, let's just retry the query
         print("Got bad gateway server in response, retrying query...")
         time.sleep(30)
@@ -120,24 +122,26 @@ def insertProperties(connection, dict):
     connection.commit()
     cur.close()
 
-def insertClassPropertyRelations(cursor, relationList):
+def insertClassPropertyRelations(cursor, relationList, outgoingRelations):
     # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class and property iri's
     # Should watch out, as the iri technically could not be unique, as that could brake this SQL
     baseSql = '''
     INSERT INTO sample.cp_rels(class_id, property_id, type_id, cnt) 
     SELECT (SELECT id from sample.classes WHERE iri = '{classIri}') AS cl_id,
     (SELECT id from sample.properties WHERE iri = '{propIri}') AS pr_id,
-    (SELECT id from sample.cp_rel_types WHERE name = 'Outgoing'),
+    (SELECT id from sample.cp_rel_types WHERE name = '{propertyDirection}'),
     {cnt}
     HAVING (SELECT id from sample.classes WHERE iri = '{classIri}') IS NOT NULL
     AND (SELECT id from sample.properties WHERE iri = '{propIri}') IS NOT NULL;
     '''
+    propertyDirectionString = "Outgoing" if outgoingRelations else "Incoming"
     totalSql = ""
     totalRelations = len(relationList)
+    print("Inserting {} {} property relations into target database...".format(totalRelations, propertyDirectionString))
     i = 0
     for class1, propery, cnt  in relationList:
         i = i + 1
-        totalSql = totalSql + baseSql.format(classIri = class1, propIri = propery, cnt = cnt)
+        totalSql = totalSql + baseSql.format(classIri = class1, propIri = propery, propertyDirection = propertyDirectionString, cnt = cnt)
         if ((i % 50000) == 0) or (i == totalRelations): 
             cursor.execute(totalSql)
             totalSql = ""
@@ -262,19 +266,26 @@ def getClassClassRelations(connection, classDict):
     connection.commit()
     cur.close()
 
-def getClassPropertyRelations(connection, classDict):
+def getClassPropertyRelations(connection, classDict, outgoingRelations=True):
     # Implements a very similar algorithm as for class-class relations, but just collecting classes based on instance count
     # Outgoing properties - 400k instance limit, otherwise timeouts
-    # This goes on for quite a while, taking up to 2 hours to get the outgoing properties
+    # Incoming properties - 2mil instance limit, otherwise timeouts
+    # This goes on for quite a while, taking up to 4 hours to get the outgoing and incoming properties
+    propertyLine = "?x ?property ?y \n"
+    classInstanceLimit = 400000
+    classInstanceLimit2 = 200000
+    classAmountLimit = 5000
+    propertyDirectionString = "Outgoing" if outgoingRelations else "Incoming"
+    if not outgoingRelations:
+        # For Incoming relations we can't batch together too many classes, as class instance amount doesn't perfectly correlate to query time 
+        classInstanceLimit = 2000000
+        propertyLine = "?y ?property ?x \n"
     query = """
         select ?property ?class (count(?y) as ?propertyInstances) where {{
-           ?x wdt:P31 ?class.
-           ?x ?property ?y
-           VALUES ?class {{ {} }}
+           ?x wdt:P31 ?class.""" + propertyLine + """ VALUES ?class {{ {} }}
         }}
         GROUP BY ?property ?class
     """
-    print("Getting Class property relations...")
     i = 0
     k = 0
     instanceCounter = 0
@@ -284,9 +295,11 @@ def getClassPropertyRelations(connection, classDict):
     collectedClasses = 0
     cur = connection.cursor()
     totalInsertedRelations = 0
+    print("Getting {} class-property relations for {} classes...".format(propertyDirectionString, totalClasses))
     for key, value in classDict.items():
         i = i + 1
-        if int(value['instances']) > 400000:
+        if int(value['instances']) > classInstanceLimit:
+            # TO-DO should specifically process these larger classes, not just skip them
             print("Class {} has too many instances, query will timeout, so skipping for now".format(key))
             continue
         # K: Counter to know which is the first processed class, can't use i for this, as we need also way to tell if it's the last class overall
@@ -297,7 +310,12 @@ def getClassPropertyRelations(connection, classDict):
             instanceCounter = instanceCounter + int(value['instances'])
             if k == 1:
                 continue
-        if ((instanceCounter + int(value['instances'])) > 200000) or (collectedClasses  == 5000) or (i == totalClasses):
+        if not outgoingRelations:
+            # Calculate batch limits, so that for smaller classes as many classes are batched together, query doesn't time out. Problematic only for incoming relations
+            power = math.floor(math.log(i, 10))
+            classInstanceLimit2 = 1000000/pow(2, power)
+            classAmountLimit = pow(10, power) if power < 4 else 1000
+        if ((instanceCounter + int(value['instances'])) > classInstanceLimit2) or (collectedClasses  == classAmountLimit) or (i == totalClasses):
             responseDict = queryWikiData(query.format(classList))
             if responseDict is not None:
                 for j in responseDict:
@@ -307,11 +325,11 @@ def getClassPropertyRelations(connection, classDict):
             instanceCounter = 0
             collectedClasses = 0
             currentRelations = len(relationList)
-            print("Property relations for {}/{} classes done...".format(i, totalClasses))
+            print("{} property relations for {}/{} classes done...".format(propertyDirectionString, i, totalClasses))
             if (currentRelations > 50000) or (i == totalClasses):
-                insertClassPropertyRelations(cur, relationList)
+                insertClassPropertyRelations(cur, relationList, outgoingRelations)
                 totalInsertedRelations = totalInsertedRelations + currentRelations
-                print("{} relations collected".format(totalInsertedRelations))
+                print("{} {} relations collected".format(propertyDirectionString, totalInsertedRelations))
                 relationList.clear()
         collectedClasses = collectedClasses + 1
         classList = classList + " <" + key + ">"
@@ -393,7 +411,8 @@ if __name__ == '__main__':
     classDict = getClasses()
     getClassLabels(classDict)
     insertClasses(DB_CON, classDict)
-    getClassPropertyRelations(DB_CON, classDict)
+    getClassPropertyRelations(DB_CON, classDict, outgoingRelations=False)
+    getClassPropertyRelations(DB_CON, classDict, outgoingRelations=True)
     getClassClassRelations(DB_CON, classDict)
     classDict.clear()
 
