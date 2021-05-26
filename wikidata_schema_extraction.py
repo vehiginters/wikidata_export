@@ -44,7 +44,8 @@ def getDbCon(params):
             print('Connecting to the PostgreSQL database...')
             DB_CON = psycopg2.connect(**params)
         except (Exception, psycopg2.DatabaseError) as error:
-            print(error)
+            raise Exception("Failed to connect to PostgreSQL database - {}".format(error))
+    return DB_CON
 
 def queryWikiData(query, retries=0):
     global LAST_MINUTE_EVENTS
@@ -74,12 +75,12 @@ def queryWikiData(query, retries=0):
             sleepTime = int(response.headers["Retry-After"])
         print("Query Limit reached. Retrying after {}s".format(sleepTime))
         time.sleep(sleepTime+1)
-        queryWikiData(query+" ", retries+1)
+        queryWikiData(query, retries+1)
     # TO-DO failed queries should be logged, not printed out in stdout
     elif response.status_code == 502: # Bad gateway server, let's just retry the query
         print("Got bad gateway server in response, retrying query...")
         time.sleep(30)
-        queryWikiData(query+" ", retries+1)
+        queryWikiData(query, retries+1)
     elif response.status_code == 500: # Query timeout, can't do much about this besides skipping
         print("Query timed out, skipping query - {}".format(query))
         return {}
@@ -126,23 +127,43 @@ def insertClassPropertyRelations(cursor, relationList, outgoingRelations):
     # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class and property iri's
     # Should watch out, as the iri technically could not be unique, as that could brake this SQL
     baseSql = '''
-    INSERT INTO sample.cp_rels(class_id, property_id, type_id, cnt) 
-    SELECT (SELECT id from sample.classes WHERE iri = '{classIri}') AS cl_id,
-    (SELECT id from sample.properties WHERE iri = '{propIri}') AS pr_id,
-    (SELECT id from sample.cp_rel_types WHERE name = '{propertyDirection}'),
-    {cnt}
-    HAVING (SELECT id from sample.classes WHERE iri = '{classIri}') IS NOT NULL
-    AND (SELECT id from sample.properties WHERE iri = '{propIri}') IS NOT NULL;
+        INSERT INTO sample.cp_rels(class_id, property_id, type_id, cnt, object_cnt)
+        SELECT (SELECT id from sample.classes WHERE iri = '{classIri}') AS cl_id,
+        (SELECT id from sample.properties WHERE iri = '{propIri}') AS pr_id,
+        (SELECT id from sample.cp_rel_types WHERE name = '{propertyDirection}'),
+        {cnt},
+        {objectCnt}
+        HAVING (SELECT id from sample.classes WHERE iri = '{classIri}') IS NOT NULL
+        AND (SELECT id from sample.properties WHERE iri = '{propIri}') IS NOT NULL;
     '''
     propertyDirectionString = "Outgoing" if outgoingRelations else "Incoming"
     totalSql = ""
     totalRelations = len(relationList)
     print("Inserting {} {} property relations into target database...".format(totalRelations, propertyDirectionString))
     i = 0
-    for class1, propery, cnt  in relationList:
+    for class1, propery, cnt, objectCnt  in relationList:
         i = i + 1
-        totalSql = totalSql + baseSql.format(classIri = class1, propIri = propery, propertyDirection = propertyDirectionString, cnt = cnt)
+        totalSql = totalSql + baseSql.format(classIri = class1, propIri = propery, propertyDirection = propertyDirectionString, cnt = cnt, objectCnt = objectCnt)
         if ((i % 50000) == 0) or (i == totalRelations): 
+            cursor.execute(totalSql)
+            totalSql = ""
+
+def updateClassPropertyRelations(cursor, relationList):
+    baseSql = '''
+        UPDATE sample.cp_rels
+        SET object_cnt = {objectCnt}
+        WHERE class_id = (SELECT id from sample.classes WHERE iri = '{classIri}')
+        AND property_id = (SELECT id from sample.properties WHERE iri = '{propIri}')
+        AND type_id = (SELECT id from sample.cp_rel_types WHERE name = 'Outgoing'));
+    '''
+    totalSql = ""
+    totalRelations = len(relationList)
+    print("Updating {} property relations into target database...".format(totalRelations))
+    i = 0
+    for class1, prop, objectCnt  in relationList:
+        i = i + 1
+        totalSql = totalSql + baseSql.format(classIri = class1, propIri = prop, objectCnt = objectCnt)
+        if ((i % 50000) == 0) or (i == totalRelations):
             cursor.execute(totalSql)
             totalSql = ""
 
@@ -153,7 +174,7 @@ def insertClassClassRelations(cursor, relationList):
     baseSql = '''
         INSERT INTO sample.cc_rels(class_1_id, class_2_id, type_id)
         SELECT (SELECT id from sample.classes WHERE iri = '{class1Iri}') AS cl_id,
-        (SELECT id from sample.classes WHERE iri = '{class2Iri}') AS pr_id,
+        (SELECT id from sample.classes WHERE iri = '{class2Iri}') AS cl2_id,
         (SELECT id from sample.cc_rel_types WHERE name = 'sub_class_of')
         HAVING (SELECT id from sample.classes WHERE iri = '{class1Iri}') IS NOT NULL
         AND (SELECT id from sample.classes WHERE iri = '{class2Iri}') IS NOT NULL;
@@ -171,7 +192,7 @@ def insertClassClassRelations(cursor, relationList):
 def getProperties():
     print("Getting list of properties...")
     query = """
-        select distinct ?property (count(?item) as ?useCount) where {{
+        SELECT DISTINCT ?property (COUNT(?item) as ?useCount) WHERE {{
            ?item ?property ?propValue
         }}
         GROUP BY ?property
@@ -189,7 +210,7 @@ def getPropertyLabels(propertiesDict):
     totalProps = len(propertiesDict)
     print("Getting property labels for {} properties...".format(totalProps))
     query = """
-        select distinct ?property ?propLabel where {{
+        SELECT DISTINCT ?property ?propLabel WHERE {{
           VALUES ?property {{ {} }}
           SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
           ?prop wikibase:directClaim ?property
@@ -215,7 +236,7 @@ def getClassClassRelations(connection, classDict):
     print("Getting Class-Class relations...")
     # A little complicated function, that gets all subclass relations between all relevant classes
     query = """
-        select distinct ?class ?subclass where {{
+        SELECT DISTINCT ?class ?subclass WHERE {{
           ?subclass wdt:P279 ?class.
           VALUES ?class {{ {} }}
         }}
@@ -279,9 +300,9 @@ def getClassPropertyRelations(connection, classDict, outgoingRelations=True):
     if not outgoingRelations:
         # For Incoming relations we can't batch together too many classes, as class instance amount doesn't perfectly correlate to query time 
         classInstanceLimit = 2000000
-        propertyLine = "?y ?property ?x \n"
+        propertyLine = "?y ?property ?x. \n"
     query = """
-        select ?property ?class (count(?y) as ?propertyInstances) where {{
+        SELECT ?property ?class (COUNT(?y) AS ?propertyInstances) WHERE {{
            ?x wdt:P31 ?class.""" + propertyLine + """ VALUES ?class {{ {} }}
         }}
         GROUP BY ?property ?class
@@ -319,7 +340,10 @@ def getClassPropertyRelations(connection, classDict, outgoingRelations=True):
             responseDict = queryWikiData(query.format(classList))
             if responseDict is not None:
                 for j in responseDict:
-                    relationList.append((j['class']['value'], j['property']['value'], int(j['propertyInstances']['value'])))
+                    objectCnt = 0
+                    if not outgoingRelations:
+                        objectCnt = int(j['propertyInstances']['value'])
+                    relationList.append((j['class']['value'], j['property']['value'], int(j['propertyInstances']['value']), objectCnt))
                 responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
             classList = ""
             instanceCounter = 0
@@ -337,12 +361,68 @@ def getClassPropertyRelations(connection, classDict, outgoingRelations=True):
     connection.commit()
     cur.close()
 
+def updateClassPropertyObjCount(connection, classDict):
+    query = """
+        SELECT ?property ?class (COUNT(?y) AS ?objectCnt) WHERE {{
+           ?x wdt:P31 ?class.
+           ?x ?property ?y.
+           FILTER  isIRI(?y)
+           VALUES ?class {{ {} }}
+        }}
+        GROUP BY ?property ?class
+    """
+    i = 0
+    k = 0
+    instanceCounter = 0
+    totalClasses = len(classDict)
+    classList = ""
+    relationList = []
+    collectedClasses = 0
+    cur = connection.cursor()
+    totalUpdatedRelations = 0
+    print("Updating outgoing class-property relation object count for {} classes...".format(totalClasses))
+    for key, value in classDict.items():
+        i = i + 1
+        if int(value['instances']) > 400000:
+            # TO-DO should specifically process these larger classes, not just skip them
+            print("Class {} has too many instances, query will timeout, so skipping for now".format(key))
+            continue
+        # K: Counter to know which is the first processed class, can't use i for this, as we need also way to tell if it's the last class overall
+        k = k + 1
+        if k == 1 or i == totalClasses:
+            collectedClasses = collectedClasses + 1
+            classList = classList + " <" + key + ">"
+            instanceCounter = instanceCounter + int(value['instances'])
+            if k == 1:
+                continue
+        if ((instanceCounter + int(value['instances'])) > 400000) or (collectedClasses  == 5000) or (i == totalClasses):
+            responseDict = queryWikiData(query.format(classList))
+            if responseDict is not None:
+                for j in responseDict:
+                    relationList.append((j['class']['value'], j['property']['value'], int(j['objectCnt']['value'])))
+                responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
+            classList = ""
+            instanceCounter = 0
+            collectedClasses = 0
+            currentRelations = len(relationList)
+            print("Outgoing class-property relation object count for {}/{} updated...".format(i, totalClasses))
+            if (currentRelations > 50000) or (i == totalClasses):
+                updateClassPropertyRelations(cur, relationList)
+                totalUpdatedRelations = totalUpdatedRelations + currentRelations
+                print("{} outgoing relations updated".format(totalUpdatedRelations))
+                relationList.clear()
+        collectedClasses = collectedClasses + 1
+        classList = classList + " <" + key + ">"
+        instanceCounter = instanceCounter + int(value['instances'])
+    connection.commit()
+    cur.close()
+
 def getClasses():
     # Get all of the relevant classes from WikiData with at least 1 instance
     # First get the classes with their instance count
     print("Getting list classes...")
     query = """
-        select ?class (count(?y) as ?instances) where {{
+        SELECT ?class (COUNT(?y) as ?instances) WHERE {{
            ?y wdt:P31 ?class.
         }}
         GROUP BY ?class
@@ -360,7 +440,7 @@ def getClasses():
     # Then count the number of subclasses for each class, later used for getting class relations
     print("Counting class subclasses...")
     query = """
-        select ?class (count(?y) as ?subclasses) where {{
+        SELECT ?class (COUNT(?y) as ?subclasses) where {{
            ?y wdt:P279 ?class.
         }}
         GROUP BY ?class
@@ -378,7 +458,7 @@ def getClassLabels(classDict):
     totalClasses = len(classDict)
     print("Getting class labels for {} classes...".format(totalClasses))
     query = """
-        select ?class ?classLabel where {{
+        SELECT ?class ?classLabel WHERE {{
            VALUES ?class {{ {} }}
            SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
         }}
@@ -401,19 +481,20 @@ def getClassLabels(classDict):
 if __name__ == '__main__': 
     conf = config('postgreSqlConnection')
 
-    getDbCon(conf)
+    databaseCon = getDbCon(conf)
 
     propDict = getProperties()
     getPropertyLabels(propDict)
-    insertProperties(DB_CON, propDict)
+    insertProperties(databaseCon, propDict)
     propDict.clear() # Clear the massive dictionary, to not take up RAM space
 
     classDict = getClasses()
     getClassLabels(classDict)
-    insertClasses(DB_CON, classDict)
-    getClassPropertyRelations(DB_CON, classDict, outgoingRelations=False)
-    getClassPropertyRelations(DB_CON, classDict, outgoingRelations=True)
-    getClassClassRelations(DB_CON, classDict)
+    insertClasses(databaseCon, classDict)
+    getClassPropertyRelations(databaseCon, classDict, outgoingRelations=False)
+    getClassPropertyRelations(databaseCon, classDict, outgoingRelations=True)
+    updateClassPropertyObjCount(databaseCon, classDict)
+    getClassClassRelations(databaseCon, classDict)
     classDict.clear()
 
-    DB_CON.close()
+    databaseCon.close()
