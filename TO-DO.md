@@ -4,8 +4,8 @@ List of requirements and general improvements to do
 * Logging - logging to file with timestamps,  
 logging general info (time taken, retrieved entities, error handling) <- already logged in console.  
 Logging also queries (failed queries with reason in normal logging, and logging all queries in detailed log level)
-* Configurable targe database schema name -  
-Currently hardcoded to "sample", but should be configurable in config file besides db info
+* ~~Configurable targe database schema name -  
+Currently hardcoded to "sample", but should be configurable in config file besides db info~~
 * Property prefixes + Local name(Wikidata P31, P67 etc. identifiers) - 
 Extract prefixes and local name from property IRIs(Wikidata properties, not external ones)
 * Class prefixes - Already extracted from IRI, just have to be properly saved in the database

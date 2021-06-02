@@ -1,4 +1,4 @@
-import requests
+import requests #Dependency used for HTTP connections
 import html
 import json
 from configparser import ConfigParser
@@ -31,12 +31,23 @@ def config(section, filename='properties.ini'):
         for param in params:
             conf[param[0]] = param[1]
     else:
-        raise Exception('Section {0} not found in the {1} file'.format(section, filename))
+        return False
+        # raise Exception('Section {0} not found in the {1} file'.format(section, filename))
     # Returns config as a dict
     return conf
 
+SCHEMA = 'sample'
+def setSchemaName():
+    global SCHEMA
+    schemaConfig = config('databaseSchema')
+    if schemaConfig:
+        SCHEMA = schemaConfig['schema']
+
 DB_CON = None
-def getDbCon(params):
+def getDbCon():
+    params = config('postgreSqlConnection')
+    if not params:
+        raise Exception("Properties file missing postgreSqlConnection section")
     # Get a connection to sparSql database using given parameters
     global DB_CON
     if DB_CON is None:
@@ -92,14 +103,14 @@ def insertClasses(connection, dict):
     # Insert classes from given dictionary into target database
     cur = connection.cursor()
     # Subclasses used while developing, just to see how many subclasses for relevant classes are there
-    baseSql = "INSERT INTO sample.classes(iri, cnt, display_name, local_name, is_unique, subclasses) VALUES('{}', {}, '{}', '{}', true, '{}');\n"
+    baseSql = "INSERT INTO {}.classes(iri, cnt, display_name, local_name, is_unique, subclasses) VALUES('{}', {}, '{}', '{}', true, '{}');\n"
     totalSql = ""
     for key, value in dict.items():
         labelValue = value['label']
         if "'" in labelValue:
-            # " ' " needs to be escaped for postgresql 
+            # " ' " needs to be escaped for postgresql
             labelValue = labelValue.replace("'", "''")
-        totalSql = totalSql + baseSql.format(key,value['instances'], labelValue, value['localname'], value['subclasses'])
+        totalSql = totalSql + baseSql.format(SCHEMA, key, value['instances'], labelValue, value['localname'], value['subclasses'])
     cur.execute(totalSql)
     connection.commit()
     cur.close()
@@ -107,7 +118,7 @@ def insertClasses(connection, dict):
 def insertProperties(connection, dict):
     # Insert classes from given dictionary into target database
     cur = connection.cursor()
-    baseSql = "INSERT INTO sample.properties(iri, cnt, display_name) VALUES('{}', {}, '{}');\n"
+    baseSql = "INSERT INTO {}.properties(iri, cnt, display_name) VALUES('{}', {}, '{}');\n"
     totalSql = ""
     for key, value in dict.items():
         useCount = value['useCount']
@@ -118,7 +129,7 @@ def insertProperties(connection, dict):
         if "'" in labelValue:
             # Same as for classes " ' " needs to be escaped for postgresql
             labelValue = labelValue.replace("'", "''")
-        totalSql = totalSql + baseSql.format(key, useCount, labelValue)
+        totalSql = totalSql + baseSql.format(SCHEMA, key, useCount, labelValue)
     cur.execute(totalSql)
     connection.commit()
     cur.close()
@@ -127,14 +138,14 @@ def insertClassPropertyRelations(cursor, relationList, outgoingRelations):
     # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class and property iri's
     # Should watch out, as the iri technically could not be unique, as that could brake this SQL
     baseSql = '''
-        INSERT INTO sample.cp_rels(class_id, property_id, type_id, cnt, object_cnt)
-        SELECT (SELECT id from sample.classes WHERE iri = '{classIri}') AS cl_id,
-        (SELECT id from sample.properties WHERE iri = '{propIri}') AS pr_id,
-        (SELECT id from sample.cp_rel_types WHERE name = '{propertyDirection}'),
+        INSERT INTO {schema}.cp_rels(class_id, property_id, type_id, cnt, object_cnt)
+        SELECT (SELECT id from {schema}.classes WHERE iri = '{classIri}') AS cl_id,
+        (SELECT id from {schema}.properties WHERE iri = '{propIri}') AS pr_id,
+        (SELECT id from {schema}.cp_rel_types WHERE name = '{propertyDirection}'),
         {cnt},
         {objectCnt}
-        HAVING (SELECT id from sample.classes WHERE iri = '{classIri}') IS NOT NULL
-        AND (SELECT id from sample.properties WHERE iri = '{propIri}') IS NOT NULL;
+        HAVING (SELECT id from {schema}.classes WHERE iri = '{classIri}') IS NOT NULL
+        AND (SELECT id from {schema}.properties WHERE iri = '{propIri}') IS NOT NULL;
     '''
     propertyDirectionString = "Outgoing" if outgoingRelations else "Incoming"
     totalSql = ""
@@ -143,18 +154,18 @@ def insertClassPropertyRelations(cursor, relationList, outgoingRelations):
     i = 0
     for class1, propery, cnt, objectCnt  in relationList:
         i = i + 1
-        totalSql = totalSql + baseSql.format(classIri = class1, propIri = propery, propertyDirection = propertyDirectionString, cnt = cnt, objectCnt = objectCnt)
-        if ((i % 50000) == 0) or (i == totalRelations): 
+        totalSql = totalSql + baseSql.format(schema = SCHEMA, classIri = class1, propIri = propery, propertyDirection = propertyDirectionString, cnt = cnt, objectCnt = objectCnt)
+        if ((i % 50000) == 0) or (i == totalRelations):
             cursor.execute(totalSql)
             totalSql = ""
 
 def updateClassPropertyRelations(cursor, relationList):
     baseSql = '''
-        UPDATE sample.cp_rels
+        UPDATE {schema}.cp_rels
         SET object_cnt = {objectCnt}
-        WHERE class_id = (SELECT id from sample.classes WHERE iri = '{classIri}')
-        AND property_id = (SELECT id from sample.properties WHERE iri = '{propIri}')
-        AND type_id = (SELECT id from sample.cp_rel_types WHERE name = 'Outgoing'));
+        WHERE class_id = (SELECT id from {schema}.classes WHERE iri = '{classIri}')
+        AND property_id = (SELECT id from {schema}.properties WHERE iri = '{propIri}')
+        AND type_id = (SELECT id from {schema}.cp_rel_types WHERE name = 'Outgoing'));
     '''
     totalSql = ""
     totalRelations = len(relationList)
@@ -162,7 +173,7 @@ def updateClassPropertyRelations(cursor, relationList):
     i = 0
     for class1, prop, objectCnt  in relationList:
         i = i + 1
-        totalSql = totalSql + baseSql.format(classIri = class1, propIri = prop, objectCnt = objectCnt)
+        totalSql = totalSql + baseSql.format(schema = SCHEMA, classIri = class1, propIri = prop, objectCnt = objectCnt)
         if ((i % 50000) == 0) or (i == totalRelations):
             cursor.execute(totalSql)
             totalSql = ""
@@ -172,19 +183,19 @@ def insertClassClassRelations(cursor, relationList):
     # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class and property iri's
     # Should watch out, as the iri technically could not be unique, as that could brake this SQL
     baseSql = '''
-        INSERT INTO sample.cc_rels(class_1_id, class_2_id, type_id)
-        SELECT (SELECT id from sample.classes WHERE iri = '{class1Iri}') AS cl_id,
-        (SELECT id from sample.classes WHERE iri = '{class2Iri}') AS cl2_id,
-        (SELECT id from sample.cc_rel_types WHERE name = 'sub_class_of')
-        HAVING (SELECT id from sample.classes WHERE iri = '{class1Iri}') IS NOT NULL
-        AND (SELECT id from sample.classes WHERE iri = '{class2Iri}') IS NOT NULL;
+        INSERT INTO {schema}.cc_rels(class_1_id, class_2_id, type_id)
+        SELECT (SELECT id from {schema}.classes WHERE iri = '{class1Iri}') AS cl_id,
+        (SELECT id from {schema}.classes WHERE iri = '{class2Iri}') AS cl2_id,
+        (SELECT id from {schema}.cc_rel_types WHERE name = 'sub_class_of')
+        HAVING (SELECT id from {schema}.classes WHERE iri = '{class1Iri}') IS NOT NULL
+        AND (SELECT id from {schema}.classes WHERE iri = '{class2Iri}') IS NOT NULL;
     '''
     totalSql = ""
     totalRelations = len(relationList)
     i = 0
     for class1, class2  in relationList:
-        totalSql = totalSql + baseSql.format(class1Iri = class1, class2Iri = class2)
-        if ((i % 50000) == 0) or (i == totalRelations): 
+        totalSql = totalSql + baseSql.format(schema = SCHEMA, class1Iri = class1, class2Iri = class2)
+        if ((i % 50000) == 0) or (i == totalRelations):
             cursor.execute(totalSql)
             totalSql = ""
     # Don't commit transaction just yet, because these relations are inserted in batches and not all at once
@@ -478,10 +489,9 @@ def getClassLabels(classDict):
             classList = ""
             print("{:.1%} done...".format(i/float(totalClasses)))
 
-if __name__ == '__main__': 
-    conf = config('postgreSqlConnection')
-
-    databaseCon = getDbCon(conf)
+if __name__ == '__main__':
+    databaseCon = getDbCon()
+    setSchemaName()
 
     propDict = getProperties()
     getPropertyLabels(propDict)

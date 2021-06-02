@@ -8,5 +8,6 @@ Then the script can be simply run with 'Python'.
 
 ## Requirements
 * psycopg2 : Python library, used for PostgreSQL database connection
+* requests : Python library, used for HTTP connections
 * PostgreSQL Database and created sample schema(Can be created from 'sample-schema-creation.pgsql')
 * properties.ini file, used for config, 'properties.ini.example' can be used as reference
