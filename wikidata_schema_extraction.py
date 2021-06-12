@@ -5,6 +5,7 @@ from configparser import ConfigParser
 import psycopg2 #Dependency used for connection to postgreSql database
 import time
 import math
+import logging
 
 #List used for keeping track of number of queries in the last minute
 LAST_MINUTE_EVENTS = list()
@@ -43,6 +44,23 @@ def setSchemaName():
     if schemaConfig:
         SCHEMA = schemaConfig['schema']
 
+LOG_LEVEL = logging.WARNING
+def setLogLevel():
+    global LOG_LEVEL
+    loggingConfig = config('logLevel')
+    logLevelMap = {
+        'DEBUG': logging.DEBUG,
+        'INFO': logging.INFO,
+        'WARNING': logging.WARNING,
+        'ERROR': logging.ERROR,
+        'CRITICAL': logging.CRITICAL
+    }
+    if loggingConfig:
+        LOG_LEVEL = logLevelMap.get(loggingConfig['level'], 'Invalid')
+        if LOG_LEVEL == 'Invalid':
+            raise Exception("Invalid log level({}), valid log levels(DEBUG,INFO,WARNING,ERROR,CRITICAL)".format(loggingConfig['level']))
+    print("Set LOG_LEVEL = {}".format(loggingConfig['level']))
+
 DB_CON = None
 def getDbCon():
     params = config('postgreSqlConnection')
@@ -52,7 +70,7 @@ def getDbCon():
     global DB_CON
     if DB_CON is None:
         try:
-            print('Connecting to the PostgreSQL database...')
+            logging.info('Connecting to the PostgreSQL database...')
             DB_CON = psycopg2.connect(**params)
         except (Exception, psycopg2.DatabaseError) as error:
             raise Exception("Failed to connect to PostgreSQL database - {}".format(error))
@@ -64,12 +82,13 @@ def queryWikiData(query, retries=0):
     lastMinuteEvents = countPastQueries()
     if lastMinuteEvents > 10:
         # If more than 10 queries been made in the last minute wait for a while, not to fail
-        print("More than 10 queries in the last minute, waiting for 60s")
+        # Limit is not really 10, but from testing seems between 10-20
+        logging.info("More than 10 queries in the last minute, waiting for 60s")
         time.sleep(61)
     if retries == 3:
         # TODO - Currently there is a problem, that a failing query even if it was because of too many requests,
         # the failing query will go into an endless fail loop
-        print("Bad requests loop skipping query for now")
+        logging.warning("Bad requests loop skipping query for now - {}".format(query))
         return {}
     url = 'https://query.wikidata.org/sparql'
     body = {'query': query,
@@ -79,25 +98,26 @@ def queryWikiData(query, retries=0):
     LAST_MINUTE_EVENTS.append(time.time())
     response = requests.post(url, data = body)
     if response.ok:
+        logging.debug("Succesful query - {}".format(query))
         return json.loads(response.text)['results']['bindings']
     elif response.status_code == 429 or response.status_code == 503 : # To many requests in the last minute, let's wait some time till we make a new one
         sleepTime = 60
         if "Retry-After" in response.headers:
             sleepTime = int(response.headers["Retry-After"])
-        print("Query Limit reached. Retrying after {}s".format(sleepTime))
+        logging.info("Query Limit reached. Retrying after {}s".format(sleepTime))
         time.sleep(sleepTime+1)
         queryWikiData(query, retries+1)
     # TO-DO failed queries should be logged, not printed out in stdout
     elif response.status_code == 502: # Bad gateway server, let's just retry the query
-        print("Got bad gateway server in response, retrying query...")
+        logging.info("Got bad gateway server in response, retrying query...")
         time.sleep(30)
         queryWikiData(query, retries+1)
     elif response.status_code == 500: # Query timeout, can't do much about this besides skipping
-        print("Query timed out, skipping query - {}".format(query))
+        logging.warning("Query timed out, skipping query - {}".format(query))
         return {}
     else:
-        print("WikiData returned response code - {}".format(response.status_code))
-        print("Failed query - {}".format(query))
+        logging.warning("WikiData returned response code - {}".format(response.status_code))
+        logging.warning("Failed query - {}".format(query))
 
 def insertClasses(connection, dict):
     # Insert classes from given dictionary into target database
@@ -150,7 +170,7 @@ def insertClassPropertyRelations(cursor, relationList, outgoingRelations):
     propertyDirectionString = "Outgoing" if outgoingRelations else "Incoming"
     totalSql = ""
     totalRelations = len(relationList)
-    print("Inserting {} {} property relations into target database...".format(totalRelations, propertyDirectionString))
+    logging.info("Inserting {} {} property relations into target database...".format(totalRelations, propertyDirectionString))
     i = 0
     for class1, propery, cnt, objectCnt  in relationList:
         i = i + 1
@@ -169,7 +189,7 @@ def updateClassPropertyRelations(cursor, relationList):
     '''
     totalSql = ""
     totalRelations = len(relationList)
-    print("Updating {} property relations into target database...".format(totalRelations))
+    logging.info("Updating {} property relations into target database...".format(totalRelations))
     i = 0
     for class1, prop, objectCnt  in relationList:
         i = i + 1
@@ -179,7 +199,7 @@ def updateClassPropertyRelations(cursor, relationList):
             totalSql = ""
 
 def insertClassClassRelations(cursor, relationList):
-    print("Inserting class relations into target database")
+    logging.info("Inserting class relations into target database")
     # As the Python script has no idea about IDs of the classes, just tell the SQL to select them based on class and property iri's
     # Should watch out, as the iri technically could not be unique, as that could brake this SQL
     baseSql = '''
@@ -201,7 +221,7 @@ def insertClassClassRelations(cursor, relationList):
     # Don't commit transaction just yet, because these relations are inserted in batches and not all at once
 
 def getProperties():
-    print("Getting list of properties...")
+    logging.info("Getting list of properties...")
     query = """
         SELECT DISTINCT ?property (COUNT(?item) as ?useCount) WHERE {{
            ?item ?property ?propValue
@@ -219,7 +239,7 @@ def getProperties():
 def getPropertyLabels(propertiesDict):
     # Get labels for classes in a given dictionary
     totalProps = len(propertiesDict)
-    print("Getting property labels for {} properties...".format(totalProps))
+    logging.info("Getting property labels for {} properties...".format(totalProps))
     query = """
         SELECT DISTINCT ?property ?propLabel WHERE {{
           VALUES ?property {{ {} }}
@@ -241,10 +261,10 @@ def getPropertyLabels(propertiesDict):
                     if j['property']['value'] in propertiesDict:
                         propertiesDict[j['property']['value']]['label'] = j['propLabel']['value']
             propertyList = ""
-            print("{:.1%} done...".format(i/float(totalProps)))
+            logging.info("{:.1%} done...".format(i/float(totalProps)))
 
 def getClassClassRelations(connection, classDict):
-    print("Getting Class-Class relations...")
+    logging.info("Getting Class-Class relations...")
     # A little complicated function, that gets all subclass relations between all relevant classes
     query = """
         SELECT DISTINCT ?class ?subclass WHERE {{
@@ -285,12 +305,12 @@ def getClassClassRelations(connection, classDict):
             relationsCounter = 0
             collectedClasses = 0
             currentRelations = len(relationList)
-            print("Relations for {}/{} classes done...".format(i, totalClasses))
+            logging.info("Relations for {}/{} classes done...".format(i, totalClasses))
             # After we collect more then 50k relations, or we are at the end, insert the class relations, but dont commit the transaction yet
             if (currentRelations > 50000) or (i == totalClasses):
                 insertClassClassRelations(cur, relationList)
                 totalInsertedRelations = totalInsertedRelations + currentRelations
-                print("{} Class relations collected".format(totalInsertedRelations))
+                logging.info("{} Class relations collected".format(totalInsertedRelations))
                 relationList.clear()
         collectedClasses = collectedClasses + 1
         classList = classList + " <" + key + ">"
@@ -327,12 +347,12 @@ def getClassPropertyRelations(connection, classDict, outgoingRelations=True):
     collectedClasses = 0
     cur = connection.cursor()
     totalInsertedRelations = 0
-    print("Getting {} class-property relations for {} classes...".format(propertyDirectionString, totalClasses))
+    logging.info("Getting {} class-property relations for {} classes...".format(propertyDirectionString, totalClasses))
     for key, value in classDict.items():
         i = i + 1
         if int(value['instances']) > classInstanceLimit:
             # TO-DO should specifically process these larger classes, not just skip them
-            print("Class {} has too many instances, query will timeout, so skipping for now".format(key))
+            logging.warning("Class {} has too many instances, query will timeout, so skipping for now".format(key))
             continue
         # K: Counter to know which is the first processed class, can't use i for this, as we need also way to tell if it's the last class overall
         k = k + 1
@@ -360,11 +380,11 @@ def getClassPropertyRelations(connection, classDict, outgoingRelations=True):
             instanceCounter = 0
             collectedClasses = 0
             currentRelations = len(relationList)
-            print("{} property relations for {}/{} classes done...".format(propertyDirectionString, i, totalClasses))
+            logging.info("{} property relations for {}/{} classes done...".format(propertyDirectionString, i, totalClasses))
             if (currentRelations > 50000) or (i == totalClasses):
                 insertClassPropertyRelations(cur, relationList, outgoingRelations)
                 totalInsertedRelations = totalInsertedRelations + currentRelations
-                print("{} {} relations collected".format(propertyDirectionString, totalInsertedRelations))
+                logging.info("{} {} relations collected".format(propertyDirectionString, totalInsertedRelations))
                 relationList.clear()
         collectedClasses = collectedClasses + 1
         classList = classList + " <" + key + ">"
@@ -391,12 +411,12 @@ def updateClassPropertyObjCount(connection, classDict):
     collectedClasses = 0
     cur = connection.cursor()
     totalUpdatedRelations = 0
-    print("Updating outgoing class-property relation object count for {} classes...".format(totalClasses))
+    logging.info("Updating outgoing class-property relation object count for {} classes...".format(totalClasses))
     for key, value in classDict.items():
         i = i + 1
         if int(value['instances']) > 400000:
             # TO-DO should specifically process these larger classes, not just skip them
-            print("Class {} has too many instances, query will timeout, so skipping for now".format(key))
+            logging.warning("Class {} has too many instances, query will timeout, so skipping for now".format(key))
             continue
         # K: Counter to know which is the first processed class, can't use i for this, as we need also way to tell if it's the last class overall
         k = k + 1
@@ -416,11 +436,11 @@ def updateClassPropertyObjCount(connection, classDict):
             instanceCounter = 0
             collectedClasses = 0
             currentRelations = len(relationList)
-            print("Outgoing class-property relation object count for {}/{} updated...".format(i, totalClasses))
+            logging.info("Outgoing class-property relation object count for {}/{} updated...".format(i, totalClasses))
             if (currentRelations > 50000) or (i == totalClasses):
                 updateClassPropertyRelations(cur, relationList)
                 totalUpdatedRelations = totalUpdatedRelations + currentRelations
-                print("{} outgoing relations updated".format(totalUpdatedRelations))
+                logging.info("{} outgoing relations updated".format(totalUpdatedRelations))
                 relationList.clear()
         collectedClasses = collectedClasses + 1
         classList = classList + " <" + key + ">"
@@ -431,7 +451,7 @@ def updateClassPropertyObjCount(connection, classDict):
 def getClasses():
     # Get all of the relevant classes from WikiData with at least 1 instance
     # First get the classes with their instance count
-    print("Getting list classes...")
+    logging.info("Getting list of classes...")
     query = """
         SELECT ?class (COUNT(?y) as ?instances) WHERE {{
            ?y wdt:P31 ?class.
@@ -447,9 +467,9 @@ def getClasses():
             if i['class']['value'][:31] == "http://www.wikidata.org/entity/":
                 localName = i['class']['value'][31:]
             classDict[i['class']['value']] = {'instances':int(i['instances']['value']), 'label': "", 'subclasses': 0, 'localname': localName}
-    print("{} classes retrieved".format(len(classDict)))
+    logging.info("{} classes retrieved".format(len(classDict)))
     # Then count the number of subclasses for each class, later used for getting class relations
-    print("Counting class subclasses...")
+    logging.info("Counting class subclasses...")
     query = """
         SELECT ?class (COUNT(?y) as ?subclasses) where {{
            ?y wdt:P279 ?class.
@@ -467,7 +487,7 @@ def getClasses():
 def getClassLabels(classDict):
     # Get labels for classes in a given dictionary
     totalClasses = len(classDict)
-    print("Getting class labels for {} classes...".format(totalClasses))
+    logging.info("Getting class labels for {} classes...".format(totalClasses))
     query = """
         SELECT ?class ?classLabel WHERE {{
            VALUES ?class {{ {} }}
@@ -487,11 +507,20 @@ def getClassLabels(classDict):
                     if j['class']['value'] in classDict:
                         classDict[j['class']['value']]['label'] = j['classLabel']['value']
             classList = ""
-            print("{:.1%} done...".format(i/float(totalClasses)))
+            logging.info("{:.1%} done...".format(i/float(totalClasses)))
 
 if __name__ == '__main__':
     databaseCon = getDbCon()
     setSchemaName()
+    setLogLevel()
+    tNow = time.localtime()
+    logging.basicConfig(
+        format='%(asctime)s %(levelname)-8s %(message)s',
+        filename=time.strftime("%Y%m%d%H%M", tNow) + '_export.log',
+        level=LOG_LEVEL,
+        force=True,
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
 
     propDict = getProperties()
     getPropertyLabels(propDict)
