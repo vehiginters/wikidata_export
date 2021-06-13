@@ -9,6 +9,63 @@ import logging
 
 #List used for keeping track of number of queries in the last minute
 LAST_MINUTE_EVENTS = list()
+WD_PREFIXES = {
+    "http://www.bigdata.com/rdf#": "bd",
+    "http://creativecommons.org/ns#": "cc",
+    "http://purl.org/dc/terms/": "dct",
+    "http://www.opengis.net/ont/geosparql#": "geo",
+    "http://www.w3.org/ns/lemon/ontolex#": "ontolex",
+    "http://www.w3.org/2002/07/owl#": "owl",
+    "http://www.wikidata.org/prop/": "p",
+    "http://www.wikidata.org/prop/qualifier/": "pq",
+    "http://www.wikidata.org/prop/qualifier/value-normalized/": "pqn",
+    "http://www.wikidata.org/prop/qualifier/value/": "pqv",
+    "http://www.wikidata.org/prop/reference/": "pr",
+    "http://www.wikidata.org/prop/reference/value-normalized/": "prn",
+    "http://www.w3.org/ns/prov#": "prov",
+    "http://www.wikidata.org/prop/reference/value/": "prv",
+    "http://www.wikidata.org/prop/statement/": "ps",
+    "http://www.wikidata.org/prop/statement/value-normalized/": "psn",
+    "http://www.wikidata.org/prop/statement/value/": "psv",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#": "rdf",
+    "http://www.w3.org/2000/01/rdf-schema#": "rdfs",
+    "http://schema.org/": "schema",
+    "http://www.w3.org/2004/02/skos/core#": "skos",
+    "http://www.wikidata.org/entity/": "wd",
+    "http://www.wikidata.org/wiki/Special:EntityData/": "wdata",
+    "http://www.wikidata.org/prop/novalue/": "wdno",
+    "http://www.wikidata.org/reference/": "wdref",
+    "http://www.wikidata.org/entity/statement/": "wds",
+    "http://www.wikidata.org/prop/direct/": "wdt",
+    "http://www.wikidata.org/prop/direct-normalized/": "wdtn",
+    "http://www.wikidata.org/value/": "wdv",
+    "http://wikiba.se/ontology#": "wikibase",
+    "http://www.w3.org/2001/XMLSchema#": "xsd",
+}
+
+def parseIri(iri):
+    lastSymbol = iri.rfind("#")
+    if lastSymbol == -1:
+        lastSymbol = iri.rfind("/")
+    baseIri = iri[:lastSymbol+1]
+    localName = ""
+    prefix = WD_PREFIXES.get(baseIri, "")
+    if iri.find("http://www.wikidata.org/") != -1:
+        localName = iri[lastSymbol+1:]
+    return prefix, localName
+
+def insertWikidataPrefixes(connection):
+    baseSql = """INSERT INTO sample.ns(name, value, priority, is_local) VALUES('{}','{}',0,false)
+                 ON CONFLICT (name)
+                 DO NOTHING;"""
+    cur = connection.cursor()
+    totalSql = ""
+    logging.info("Adding {} prefixes to ns".format(len(WD_PREFIXES)))
+    for key, value in WD_PREFIXES.items():
+        totalSql = totalSql + baseSql.format(value, key)
+    cur.execute(totalSql)
+    connection.commit()
+    cur.close()
 
 def countPastQueries():
     # Function used to go over the last event list and cut off the list after finding the first expired event
@@ -123,22 +180,30 @@ def insertClasses(connection, dict):
     # Insert classes from given dictionary into target database
     cur = connection.cursor()
     # Subclasses used while developing, just to see how many subclasses for relevant classes are there
-    baseSql = "INSERT INTO {}.classes(iri, cnt, display_name, local_name, is_unique, subclasses) VALUES('{}', {}, '{}', '{}', true, '{}');\n"
+    baseSql = '''
+        INSERT INTO {schema}.classes(ns_id, iri, cnt, display_name, local_name, is_unique, subclasses)
+        SELECT (SELECT id FROM {schema}.ns WHERE name = '{prefix}') AS ns_id,
+        '{iri}', {instances}, '{label}', '{localName}', true, {subclasses};\n'''
     totalSql = ""
     for key, value in dict.items():
         labelValue = value['label']
         if "'" in labelValue:
             # " ' " needs to be escaped for postgresql
             labelValue = labelValue.replace("'", "''")
-        totalSql = totalSql + baseSql.format(SCHEMA, key, value['instances'], labelValue, value['localname'], value['subclasses'])
+        prefix, localName = parseIri(key)
+        totalSql = totalSql + baseSql.format(schema=SCHEMA, iri=key, prefix=prefix,
+            instances=value['instances'], label=labelValue, localName=localName, subclasses=value['subclasses'])
     cur.execute(totalSql)
     connection.commit()
     cur.close()
 
 def insertProperties(connection, dict):
-    # Insert classes from given dictionary into target database
+    # Insert properties from given dictionary into target database
     cur = connection.cursor()
-    baseSql = "INSERT INTO {}.properties(iri, cnt, display_name) VALUES('{}', {}, '{}');\n"
+    baseSql = '''
+        INSERT INTO {schema}.properties(ns_id, iri, cnt, display_name, local_name)
+        SELECT (SELECT id FROM {schema}.ns WHERE name = '{prefix}') AS ns_id,
+        '{iri}', {cnt}, '{label}', '{localName}';\n'''
     totalSql = ""
     for key, value in dict.items():
         useCount = value['useCount']
@@ -149,7 +214,9 @@ def insertProperties(connection, dict):
         if "'" in labelValue:
             # Same as for classes " ' " needs to be escaped for postgresql
             labelValue = labelValue.replace("'", "''")
-        totalSql = totalSql + baseSql.format(SCHEMA, key, useCount, labelValue)
+        prefix, localName = parseIri(key)
+        totalSql = totalSql + baseSql.format(schema=SCHEMA, prefix=prefix, iri=key,
+         cnt=useCount, label=labelValue, localName=localName)
     cur.execute(totalSql)
     connection.commit()
     cur.close()
@@ -463,10 +530,7 @@ def getClasses():
     classDict = {}
     if responseDict is not None:
         for i in responseDict:
-            localName = ""
-            if i['class']['value'][:31] == "http://www.wikidata.org/entity/":
-                localName = i['class']['value'][31:]
-            classDict[i['class']['value']] = {'instances':int(i['instances']['value']), 'label': "", 'subclasses': 0, 'localname': localName}
+            classDict[i['class']['value']] = {'instances':int(i['instances']['value']), 'label': "", 'subclasses': 0}
     logging.info("{} classes retrieved".format(len(classDict)))
     # Then count the number of subclasses for each class, later used for getting class relations
     logging.info("Counting class subclasses...")
@@ -511,6 +575,7 @@ def getClassLabels(classDict):
 
 if __name__ == '__main__':
     databaseCon = getDbCon()
+
     setSchemaName()
     setLogLevel()
     tNow = time.localtime()
@@ -521,6 +586,8 @@ if __name__ == '__main__':
         force=True,
         datefmt='%Y-%m-%d %H:%M:%S'
     )
+
+    insertWikidataPrefixes(databaseCon)
 
     propDict = getProperties()
     getPropertyLabels(propDict)

@@ -885,7 +885,7 @@ COPY sample.ns (id, name, value, priority, is_local) FROM stdin;
 15	yago	http://dbpedia.org/class/yago/	90	f
 17	umbel-rc	http://umbel.org/umbel/rc/	40	f
 18	dul	http://www.ontologydesignpatterns.org/ont/dul/DUL.owl	60	f
-13	wikidata	http://www.wikidata.org/entity/	-1	f
+13	wd	http://www.wikidata.org/entity/	-1	f
 23	vann	http://purl.org/vocab/vann/	0	f
 24	geo	http://www.w3.org/2003/01/geo/wgs84_pos#	0	f
 25	prov	http://www.w3.org/ns/prov#	0	f
@@ -899,6 +899,28 @@ COPY sample.ns (id, name, value, priority, is_local) FROM stdin;
 22	umbel	http://umbel.org/umbel#	0	f
 33	cc	http://creativecommons.org/ns#	0	f
 34	dav	http://www.openlinksw.com/schemas/DAV#	0	f
+35  bd http://www.bigdata.com/rdf#  0   f
+36  geo http://www.opengis.net/ont/geosparql#  0   f
+37  ontolex http://www.w3.org/ns/lemon/ontolex#  0   f
+38  p http://www.wikidata.org/prop/  0   f
+39  pq http://www.wikidata.org/prop/qualifier/  0   f
+40  pqn http://www.wikidata.org/prop/qualifier/value-normalized/  0   f
+41  pqv http://www.wikidata.org/prop/qualifier/value/  0   f
+42  pr http://www.wikidata.org/prop/reference/  0   f
+43  prn http://www.wikidata.org/prop/reference/value-normalized/  0   f
+44  prov http://www.w3.org/ns/prov#  0   f
+45  prv http://www.wikidata.org/prop/reference/value/  0   f
+46  ps http://www.wikidata.org/prop/statement/  0   f
+47  psn http://www.wikidata.org/prop/statement/value-normalized/  0   f
+48  psv http://www.wikidata.org/prop/statement/value/  0   f
+49  wdata http://www.wikidata.org/wiki/Special:EntityData/  0   f
+50  wdno http://www.wikidata.org/prop/novalue/  0   f
+51  wdref http://www.wikidata.org/reference/  0   f
+52  wds http://www.wikidata.org/entity/statement/  0   f
+53  wdt http://www.wikidata.org/prop/direct/  0   f
+54  wdtn http://www.wikidata.org/prop/direct-normalized/  0   f
+55  wdv http://www.wikidata.org/value/  0   f
+56  wikibase http://wikiba.se/ontology#  0   f
 \.
 
 
