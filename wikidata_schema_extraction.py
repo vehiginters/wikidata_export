@@ -185,7 +185,10 @@ def insertClasses(connection, dict):
         SELECT (SELECT id FROM {schema}.ns WHERE name = '{prefix}') AS ns_id,
         '{iri}', {instances}, '{label}', '{localName}', true, {subclasses};\n'''
     totalSql = ""
+    i = 0
+    totalClasses = len(dict)
     for key, value in dict.items():
+        i = i + 1
         labelValue = value['label']
         if "'" in labelValue:
             # " ' " needs to be escaped for postgresql
@@ -193,7 +196,9 @@ def insertClasses(connection, dict):
         prefix, localName = parseIri(key)
         totalSql = totalSql + baseSql.format(schema=SCHEMA, iri=key, prefix=prefix,
             instances=value['instances'], label=labelValue, localName=localName, subclasses=value['subclasses'])
-    cur.execute(totalSql)
+        if ((i % 50000) == 0) or (i == totalClasses):
+            cur.execute(totalSql)
+            totalSql = ""
     connection.commit()
     cur.close()
 
@@ -201,11 +206,14 @@ def insertProperties(connection, dict):
     # Insert properties from given dictionary into target database
     cur = connection.cursor()
     baseSql = '''
-        INSERT INTO {schema}.properties(ns_id, iri, cnt, display_name, local_name)
+        INSERT INTO {schema}.properties(ns_id, iri, cnt, display_name, local_name, object_cnt)
         SELECT (SELECT id FROM {schema}.ns WHERE name = '{prefix}') AS ns_id,
-        '{iri}', {cnt}, '{label}', '{localName}';\n'''
+        '{iri}', {cnt}, '{label}', '{localName}', {objCount};\n'''
     totalSql = ""
+    i = 0
+    totalProperties = len(dict)
     for key, value in dict.items():
+        i = i + 1
         useCount = value['useCount']
         if useCount > 2100000000:
             # There is one property with more than 2'100'000'000, which goes out of properties table 'cnt' column integer range, so just put it at limit
@@ -216,8 +224,10 @@ def insertProperties(connection, dict):
             labelValue = labelValue.replace("'", "''")
         prefix, localName = parseIri(key)
         totalSql = totalSql + baseSql.format(schema=SCHEMA, prefix=prefix, iri=key,
-         cnt=useCount, label=labelValue, localName=localName)
-    cur.execute(totalSql)
+         cnt=useCount, label=labelValue, localName=localName, objCount=value['objCount'])
+        if ((i % 50000) == 0) or (i == totalProperties):
+            cur.execute(totalSql)
+            totalSql = ""
     connection.commit()
     cur.close()
 
@@ -300,7 +310,7 @@ def getProperties():
     resultDict = {}
     if responseDict is not None:
         for i in responseDict:
-            resultDict[i['property']['value']] = {'useCount':int(i['useCount']['value']), 'label': ""}
+            resultDict[i['property']['value']] = {'useCount':int(i['useCount']['value']), 'label': "", 'objCount': 0}
     return resultDict
 
 def getPropertyLabels(propertiesDict):
