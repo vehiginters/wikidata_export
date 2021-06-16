@@ -297,6 +297,28 @@ def insertClassClassRelations(cursor, relationList):
             totalSql = ""
     # Don't commit transaction just yet, because these relations are inserted in batches and not all at once
 
+
+def insertPropObjCount(connection, propDict):
+    # Update property object count in target database
+    baseSql = '''
+        UPDATE {schema}.properties
+        SET object_cnt = {objectCnt}
+        WHERE iri = '{propIri}';
+    '''
+    cur = connection.cursor()
+    totalSql = ""
+    totalProps = len(propDict)
+    logging.info("Updating property object count into target database...")
+    i = 0
+    for key, value in propDict.items():
+        i = i + 1
+        totalSql = totalSql + baseSql.format(schema = SCHEMA, propIri = key, objectCnt = int(value))
+        if ((i % 30000) == 0) or (i == totalProps):
+            cur.execute(totalSql)
+            totalSql = ""
+    connection.commit()
+    cur.close()
+
 def getProperties():
     logging.info("Getting list of properties...")
     query = """
@@ -525,6 +547,72 @@ def updateClassPropertyObjCount(connection, classDict):
     connection.commit()
     cur.close()
 
+def updatePropertyObjCount(propDict):
+    # Update object count for properties
+    # For properties with over 2mil uses in triples, we just take an estimate for 2mil
+    # and calculate estimate for total uses for property
+    logging.info("Getting property object count...")
+    limitQuery = '''
+    SELECT (count(?y) as ?objCount) WHERE {{
+        {{select ?y where {{?x {property} ?y.}} LIMIT 2000000}}.
+        FILTER isIRI(?y).
+    }}
+    '''
+    query = '''
+    SELECT ?property (COUNT(?y) AS ?objectCnt) WHERE {{
+        ?x ?property ?y.
+        FILTER  isIRI(?y)
+        VALUES ?property {{ {propertyList} }}
+    }}
+    GROUP BY ?property
+    '''
+    # Algorithm works the same as for 'updateClassPropertyObjCount' and 'getClassPropertyRelations'
+    # To put it simply group multiple properties based on use count, to minimize queries against wikidata
+    totalProperties = len(propDict)
+    i = 0
+    k = 0
+    propList = ""
+    collectedProps = 0
+    propCounter = 0
+    resultDict = {}
+    for key, value in propDict.items():
+        i = i + 1
+        if int(value['useCount']) > 2000000:
+            responseDict = queryWikiData(limitQuery.format(property=" <" + key + ">"))
+            if responseDict is not None:
+                for j in responseDict:
+                    proportion =  int(j['objCount']['value']) / 2000000
+                    resultDict[key] = int(value['useCount']) * proportion
+                    logging.info("<{}> property is too big, getting estimate obj count : {}".format(key, int(value['useCount']) * proportion))
+                responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
+            if (i == totalProperties): # Here let's catch the case, where last prop is large and we get obj count for props left in list
+                responseDict = queryWikiData(query.format(propertyList=propList))
+                if responseDict is not None:
+                    for j in responseDict:
+                        resultDict[j['property']['value']] = j['objectCnt']['value']
+                    responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
+        else:
+            k = k + 1
+            if k == 1 or i == totalProperties:
+                collectedProps = collectedProps + 1
+                propList = propList + " <" + key + ">"
+                propCounter = propCounter + int(value['useCount'])
+                if k == 1:
+                    continue
+            if ((propCounter + int(value['useCount'])) > 6000000) or (collectedProps  == 5000) or (i == totalProperties):
+                responseDict = queryWikiData(query.format(propertyList=propList))
+                if responseDict is not None:
+                    for j in responseDict:
+                        resultDict[j['property']['value']] = j['objectCnt']['value']
+                    responseDict.clear() # Clear the response dict as fast as we can, to free up used memory
+                propList = ""
+                propCounter = 0
+                collectedProps = 0
+            collectedProps = collectedProps + 1
+            propList = propList + " <" + key + ">"
+            propCounter = propCounter + int(value['useCount'])
+    return resultDict
+
 def getClasses():
     # Get all of the relevant classes from WikiData with at least 1 instance
     # First get the classes with their instance count
@@ -602,6 +690,8 @@ if __name__ == '__main__':
     propDict = getProperties()
     getPropertyLabels(propDict)
     insertProperties(databaseCon, propDict)
+    propObjCountDict = updatePropertyObjCount(propDict)
+    insertPropObjCount(databaseCon, propObjCountDict)
     propDict.clear() # Clear the massive dictionary, to not take up RAM space
 
     classDict = getClasses()

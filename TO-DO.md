@@ -13,4 +13,4 @@ Extract prefixes and local name from property IRIs(Wikidata properties, not exte
 they should be handled seperately. Already tried multiple approaches, that failes, neither we can go over properties  
 in one class context or instances in one class context, because for classes with over 3-4 mil instances,  
 we can't retrieve full instance list in the time limit.
-* Count proprty object count
+* ~~Count proprty object count~~
