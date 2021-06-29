@@ -147,13 +147,14 @@ def queryWikiData(query, retries=0):
         # the failing query will go into an endless fail loop
         logging.warning("Bad requests loop skipping query for now - {}".format(query))
         return {}
+    # 'Wikidata schema extraction Bot/1.0 (https://github.com/vehiginters/wikidata_export, vehiginters@gmail.com)'
     url = 'https://query.wikidata.org/sparql'
     body = {'query': query,
-            'format': 'json',
-            # Proper user-agent to identify the caller as specified by WikiData query API specification
-            'User-Agent': 'Wikidata schema extraction Bot/1.0 (https://github.com/vehiginters/wikidata_export, vehiginters@gmail.com)',}
+            'format': 'json',}
+    # Proper user-agent to identify the caller as specified by WikiData query API specification
+    headers = { 'User-Agent': 'Wikidata schema extraction Bot/1.0 (https://github.com/vehiginters/wikidata_export, vehiginters@gmail.com)'}
     LAST_MINUTE_EVENTS.append(time.time())
-    response = requests.post(url, data = body)
+    response = requests.post(url, headers = headers, data = body)
     if response.ok:
         logging.debug("Succesful query - {}".format(query))
         return json.loads(response.text)['results']['bindings']
@@ -253,6 +254,38 @@ def insertClassPropertyRelations(cursor, relationList, outgoingRelations):
         i = i + 1
         totalSql = totalSql + baseSql.format(schema = SCHEMA, classIri = class1, propIri = propery, propertyDirection = propertyDirectionString, cnt = cnt, objectCnt = objectCnt)
         if ((i % 50000) == 0) or (i == totalRelations):
+            cursor.execute(totalSql)
+            totalSql = ""
+
+def insertConstraintRelations(cursor, constraintList):
+    # Insert class and property constraint relations into target database
+    baseSql = '''
+        INSERT INTO {schema}.cp_rels(class_id, property_id, type_id, cnt, object_cnt)
+        SELECT (SELECT id from {schema}.classes WHERE iri = '{classIri}') AS cl_id,
+        (SELECT id from {schema}.properties WHERE iri = '{propIri}') AS pr_id,
+        (SELECT id from {schema}.cp_rel_types WHERE name = '{constraintType}'),
+        {cnt},
+        {objectCnt}
+        HAVING (SELECT id from {schema}.classes WHERE iri = '{classIri}') IS NOT NULL
+        AND (SELECT id from {schema}.properties WHERE iri = '{propIri}') IS NOT NULL;
+    '''
+    relTypeSql = '''
+        INSERT INTO {schema}.cp_rel_types(id, name) VALUES({id},'{name}')
+             ON CONFLICT (id)
+             DO NOTHING;
+    '''
+    # Make sure that type_constraint and value_type_constraint cp_rel_types are in database
+    cursor.execute(relTypeSql.format(schema = SCHEMA, id=11, name='type_constraint'))
+    cursor.execute(relTypeSql.format(schema = SCHEMA, id=12, name='value_type_constraint'))
+    totalSql = ""
+    totalConstraints = len(constraintList)
+    logging.info("Inserting {} constraint relations into target database...".format(totalConstraints))
+    i = 0
+    for cl, prop, constrType in constraintList:
+        i = i + 1
+        constr = 'type_constraint' if constrType == 11 else 'value_type_constraint'
+        totalSql = totalSql + baseSql.format(schema = SCHEMA, classIri = cl, propIri = prop, constraintType = constr, cnt = 0, objectCnt = 0)
+        if ((i % 50000) == 0) or (i == totalConstraints):
             cursor.execute(totalSql)
             totalSql = ""
 
@@ -736,6 +769,38 @@ def processLargeClasses(connection, classDict):
     connection.commit()
     cur.close()
 
+def getClassPropertyConstraints(connection, classDict):
+    logging.info("Getting Class-Property constraints...")
+    query = """
+        SELECT DISTINCT ?class ?property ?constraint {{
+          ?prop p:P2302 [ ps:P2302 ?constraint ; pq:P2308 ?class ; pq:P2309 wd:Q21503252 ].
+          ?prop wikibase:directClaim ?property.
+          VALUES ?class {{ {classList} }}.
+          VALUES ?constraint {{ wd:Q21503250 wd:Q21510865 }}.
+        }}
+    """
+    i = 0
+    cur = connection.cursor()
+    classList = ""
+    totalClasses = len(classDict)
+    constraintList = []
+    classLimit = 500 # For first largest classes take only 500 classes, as constraints are mostly just used for the largest classes
+    for key in classDict:
+        i = i + 1
+        classList = classList + " <" + key + ">"
+        if ((i % classLimit) == 0) or (i == totalClasses):
+            classLimit = 10000 # For the rest of the classes group them up by 10k
+            responseDict = queryWikiData(query.format(classList=classList))
+            if responseDict is not None:
+                for j in responseDict:
+                    constraintType = 11 if j['constraint']['value'] == 'http://www.wikidata.org/entity/Q21503250' else 12
+                    constraintList.append((key, j['property']['value'], constraintType))
+            classList = ""
+            logging.info("{:.1%} done...".format(i/float(totalClasses)))
+    insertConstraintRelations(cur, constraintList)
+    connection.commit()
+    cur.close()
+
 if __name__ == '__main__':
     databaseCon = getDbCon()
 
@@ -767,6 +832,7 @@ if __name__ == '__main__':
     updateClassPropertyObjCount(databaseCon, classDict)
     getClassClassRelations(databaseCon, classDict)
     processLargeClasses(databaseCon, classDict)
+    getClassPropertyConstraints(databaseCon, classDict)
     classDict.clear()
 
     databaseCon.close()
